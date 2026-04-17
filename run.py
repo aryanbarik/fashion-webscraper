@@ -13,6 +13,7 @@ import os
 import httpx
 import boto3
 
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from urllib.parse import urlparse
 from dotenv import load_dotenv
@@ -73,26 +74,34 @@ async def fetch_and_upload(
     bucket: str,
     image_url: str,
     s3_key: str,
+    executor: ThreadPoolExecutor,
+    semaphore: asyncio.Semaphore,
 ) -> str | None:
-    """Download image bytes and upload directly to S3. Returns the S3 URL on success."""
-    try:
-        r = await http.get(image_url, timeout=20)
-        r.raise_for_status()
+    """Download image bytes then upload to S3 via a thread pool (boto3 is blocking).
+    A semaphore limits concurrent requests to avoid rate-limiting."""
+    async with semaphore:
+        try:
+            r = await http.get(image_url, timeout=20)
+            r.raise_for_status()
 
-        content_type = r.headers.get("content-type", "image/jpeg")
-        s3.put_object(
-            Bucket=bucket,
-            Key=s3_key,
-            Body=r.content,
-            ContentType=content_type,
-        )
+            content_type = r.headers.get("content-type", "image/jpeg")
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(
+                executor,
+                lambda: s3.put_object(
+                    Bucket=bucket,
+                    Key=s3_key,
+                    Body=r.content,
+                    ContentType=content_type,
+                ),
+            )
 
-        region = os.environ["AWS_REGION"]
-        return f"https://{bucket}.s3.{region}.amazonaws.com/{s3_key}"
+            region = os.environ["AWS_REGION"]
+            return f"https://{bucket}.s3.{region}.amazonaws.com/{s3_key}"
 
-    except Exception as e:
-        print(f"  [!] Failed {image_url}: {e}")
-        return None
+        except Exception as e:
+            print(f"  [!] Failed {image_url}: {type(e).__name__}: {e}")
+            return None
 
 
 async def main() -> None:
@@ -118,19 +127,23 @@ async def main() -> None:
             print("\n[=] Nothing new to upload.")
             return
 
-        # Build upload tasks
+        # Build upload tasks — S3 uploads run in a thread pool to avoid
+        # blocking the event loop (boto3 is synchronous). A semaphore caps
+        # concurrent requests so we don't get rate-limited.
         print(f"\n[>] Uploading {len(all_new)} images to s3://{bucket}...")
+        semaphore = asyncio.Semaphore(20)
         records = []
         tasks = []
-        for product in all_new:
-            ext = Path(urlparse(product.image_url).path).suffix or ".jpg"
-            s3_key = f"images/{product.product_id}{ext}"
-            d = product.to_dict()
-            d["s3_key"] = s3_key
-            records.append(d)
-            tasks.append(fetch_and_upload(http, s3, bucket, product.image_url, s3_key))
+        with ThreadPoolExecutor(max_workers=20) as executor:
+            for product in all_new:
+                ext = Path(urlparse(product.image_url).path).suffix or ".jpg"
+                s3_key = f"images/{product.product_id}{ext}"
+                d = product.to_dict()
+                d["s3_key"] = s3_key
+                records.append(d)
+                tasks.append(fetch_and_upload(http, s3, bucket, product.image_url, s3_key, executor, semaphore))
 
-        s3_urls = await asyncio.gather(*tasks)
+            s3_urls = await asyncio.gather(*tasks)
 
     uploaded = 0
     for record, url in zip(records, s3_urls):
